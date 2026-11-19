@@ -1,0 +1,14 @@
+{
+  "name": "troika-three-utils",
+  "version": "0.53.1",
+  "description": "Various utilities related to Three.js",
+  "author": "Jason Johnston <jason.johnston@protectwise.com>",
+  "license": "MIT",
+  "sideEffects": false,
+  "main": "dist/troika-three-utils.umd.js",
+  "module": "dist/troika-three-utils.esm.js",
+  "module:src": "src/index.js",
+  "peerDependencies": {
+    "three": ">=0.125.0"
+  }
+}

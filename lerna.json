@@ -1,0 +1,16 @@
+{
+  "packages": [
+    "packages/*"
+  ],
+  "version": "0.53.1",
+  "command": {
+    "version": {
+      "conventionalCommits": true
+    },
+    "publish": {
+      "allowBranch": [
+        "main"
+      ]
+    }
+  }
+}
