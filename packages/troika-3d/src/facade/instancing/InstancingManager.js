@@ -1,17 +1,14 @@
 import { utils } from 'troika-core'
 import {
-  InstancedBufferAttribute,
-  InstancedBufferGeometry,
   Matrix4
 } from 'three'
 import Group3DFacade from '../Group3DFacade.js'
 import { getInstancingDerivedMaterial } from './InstancingDerivedMaterial.js'
-import { getShadersForMaterial } from 'troika-three-utils'
+import { MemberBatch, getDefaultUniformValue } from '../members/MemberBatch.js'
 
 const { assign } = utils
 
 const INSTANCE_BATCH_SIZE = 128 //TODO make this an option?
-const DYNAMIC_DRAW = 0x88E8 //can't import DynamicDrawUsage from three without breaking older versions
 
 /**
  * An InstancingManager handles aggregating all Instanceable3DFacade descendants into
@@ -32,14 +29,23 @@ const DYNAMIC_DRAW = 0x88E8 //can't import DynamicDrawUsage from three without b
  * kicking in.
  *
  * Also see InstancingShaderUpgrades, which modifies material shaders so they accept the matrix
- * and custom uniform values coming in as attributes. This allows built-in materials as well
- * as custom shaders to work with instancing without manual modification.
+ * and custom uniform values coming in as attributes. This allows built-in materials as well as
+ * custom shaders to work with instancing without manual modification.
+ *
+ * == Shared member data ==
+ *
+ * All per-instance state (world matrix, per-instance uniforms/colors) lives in
+ * {@link MemberBatch} member records, also exposed on each facade as `this._memberRecord`.
+ * The very same records can be handed to an ordinary `THREE.InstancedMesh` (via
+ * `memberBatch.getInstancedMesh()`) to render the identical columns/spheres without any scene
+ * facade at all; both paths read back the same world coordinates because there is only one
+ * matrix per member.
  */
 class InstancingManager extends Group3DFacade {
   constructor(parent) {
     super(parent)
     this._instanceables = Object.create(null)
-    this._batchGeometryPool = new BatchGeometryPool()
+    this._memberBatchesByKey = Object.create(null)
     this._needsRebatch = true
     this.addEventListener('beforerender', this._setupBatchObjects.bind(this))
     this.addEventListener('afterrender', this._teardownBatchObjects.bind(this))
@@ -51,6 +57,85 @@ class InstancingManager extends Group3DFacade {
       handler.call(this, source, data)
     } else if (this.parent) {
       this.parent.onNotifyWorld(source, message, data)
+    }
+  }
+
+  /**
+   * Get (or lazily create) the MemberBatch holding the shared member records for a render batch
+   * slot. A single proto object can span several render batches once it exceeds
+   * INSTANCE_BATCH_SIZE members, so each render batch gets its own MemberBatch whose packed
+   * geometry it renders.
+   */
+  _getMemberBatch (protoObject, batchKey, slot) {
+    const slots = this._memberBatchesByKey[batchKey] || (this._memberBatchesByKey[batchKey] = [])
+    let memberBatch = slots[slot]
+    if (!memberBatch) {
+      const uniformNames = this._getInstanceUniformNames(protoObject)
+      memberBatch = slots[slot] = new MemberBatch({
+        geometry: protoObject.geometry,
+        material: protoObject.material,
+        maxMembers: INSTANCE_BATCH_SIZE,
+        uniforms: uniformNames || undefined
+      })
+    }
+    return memberBatch
+  }
+
+  /**
+   * Empty every backing MemberBatch at the start of a full rebatch, while keeping the batch
+   * objects themselves so their pooled GPU buffers are reused. Also clear each facade's record
+   * back-reference so _getMemberRecord re-adds its (recycled) record to the correct batch.
+   */
+  _resetMemberBatches () {
+    for (let key in this._memberBatchesByKey) {
+      this._memberBatchesByKey[key].forEach(memberBatch => {
+        if (memberBatch) {
+          memberBatch.members.length = 0
+          memberBatch.invalidate()
+        }
+      })
+    }
+    for (let facadeId in this._instanceables) {
+      const facade = this._instanceables[facadeId]
+      if (facade._memberRecord) {
+        facade._memberRecord._memberBatch = null
+        facade._memberBatch = null
+      }
+    }
+  }
+
+  /**
+   * Get the member record backing a facade, creating it within the given MemberBatch on first
+   * use and keeping the back-references in sync.
+   */
+  _getMemberRecord (facade, memberBatch) {
+    let record = facade._memberRecord
+    if (!record || record._memberBatch !== memberBatch) {
+      // Recycling a record that was detached in _resetMemberBatches: addMember() will reassign
+      // its packing index within the new batch. A brand-new record is created when there is none.
+      record = memberBatch.addMember(record)
+      record._memberBatch = memberBatch
+      facade._memberRecord = record
+      facade._memberBatch = memberBatch
+    }
+    return record
+  }
+
+  _syncFacadeToRecord (facade, protoObject, record) {
+    // World matrix: the facade's threeObject.matrixWorld is the single source of truth
+    record.matrix.copy(facade.threeObject.matrixWorld)
+    record.visible = facade.threeObject.visible !== false
+
+    // Per-instance uniforms (e.g. diffuse color, custom radius)
+    const names = this._getInstanceUniformNames(protoObject)
+    if (names) {
+      const facadeUniforms = facade._instanceUniforms
+      for (let i = names.length; i--;) {
+        const name = names[i]
+        const value = (facadeUniforms && name in facadeUniforms) ?
+          facadeUniforms[name] : getDefaultUniformValue(protoObject.material, name)
+        record.uniforms[name] = value
+      }
     }
   }
 
@@ -74,68 +159,55 @@ class InstancingManager extends Group3DFacade {
 
     if (needsRebatch) {
       batchObjectsByKey = this._batchObjectsByKey = Object.create(null)
-      let geometryPool = this._batchGeometryPool
+      // A full rebatch reassigns every facade to (possibly new) batches, so detach any prior
+      // member-record -> batch associations. The records themselves are retained and recycled by
+      // _getMemberRecord below, but their old batches must start empty for this frame's packing.
+      this._resetMemberBatches()
       for (let facadeId in instanceables) {
         let facade = instanceables[facadeId]
         let instanceObject = facade.threeObject
         let protoObject = facade.instancedThreeObject
 
         if (protoObject && instanceObject.visible) {
-          // Find or create the batch object for this facade's instancedThreeObject
+          // Find the render batch + its backing MemberBatch for this facade's instancedThreeObject
           let batchKey = this._getBatchKey(protoObject)
-          let instanceUniforms = this._getInstanceUniformNames(protoObject)
           let batchObjects = batchObjectsByKey[batchKey] || (batchObjectsByKey[batchKey] = [])
           let batchObject = batchObjects[batchObjects.length - 1]
-          let batchGeometry = batchObject && batchObject.geometry
-          if (!batchGeometry || getInstanceCount(batchGeometry) === INSTANCE_BATCH_SIZE) {
-            batchObject = this._getBatchObject(protoObject)
-            batchGeometry = batchObject.geometry
-            let attrs = batchGeometry._instanceAttrs.matrix
-            for (let row = 0; row < 3; row++) {
-              attrs[row].version++
-            }
-            if (instanceUniforms) {
-              attrs = batchGeometry._instanceAttrs.uniforms
-              for (let i = instanceUniforms.length; i--;) {
-                attrs[instanceUniforms[i]].version++
-              }
-            }
+          let memberBatch = batchObject && batchObject.$memberBatch
+          if (!memberBatch || memberBatch.members.length === INSTANCE_BATCH_SIZE) {
+            const slot = batchObjects.length
+            memberBatch = this._getMemberBatch(protoObject, batchKey, slot)
+            batchObject = this._getBatchObject(protoObject, memberBatch)
             batchObjects.push(batchObject)
           }
 
-          // Put the instance's world matrix into the batch geometry's instancing attributes
-          let attrOffset = getInstanceCount(batchGeometry)
-          setInstanceCount(batchGeometry, attrOffset + 1)
-          let attrs = batchGeometry._instanceAttrs.matrix
-          let elements = instanceObject.matrixWorld.elements //column order
-          attrs[0].setXYZW(attrOffset, elements[0], elements[4], elements[8], elements[12])
-          attrs[1].setXYZW(attrOffset, elements[1], elements[5], elements[9], elements[13])
-          attrs[2].setXYZW(attrOffset, elements[2], elements[6], elements[10], elements[14])
-
-          // Put the instance's values for instanceUniforms into the corresponding attributes
-          if (instanceUniforms) {
-            attrs = batchGeometry._instanceAttrs.uniforms
-            for (let i = instanceUniforms.length; i--;) {
-              let uniform = instanceUniforms[i]
-              let attr = attrs[uniform]
-              let facadeUniforms = facade._instanceUniforms
-              let value = facadeUniforms && (uniform in facadeUniforms) ?
-                facadeUniforms[uniform] : getDefaultUniformValue(protoObject.material, uniform)
-              setAttributeValue(attr, attrOffset, value)
-            }
+          // The facade's member record is the shared source of truth for its world matrix and
+          // per-instance uniforms. Sync its current state into the member batch.
+          const record = this._getMemberRecord(facade, memberBatch)
+          this._syncFacadeToRecord(facade, protoObject, record)
+          memberBatch.markMemberMatrixDirty(record)
+          // Uniform values may have changed without a setInstanceUniform notification; mark them
+          // all dirty so the next pack rewrites this member's uniform attributes.
+          if (record.uniforms) {
+            record._uniformDirty = record._uniformDirty || Object.create(null)
+            for (let name in record.uniforms) record._uniformDirty[name] = true
           }
 
           // Save pointers for possible reuse next frame
           facade._instancingBatchObject = batchObject
-          facade._instancingBatchAttrOffset = attrOffset
+          facade._instancingBatchAttrOffset = record.index
         } else {
           facade._instancingBatchObject = facade._instancingBatchAttrOffset = null
         }
       }
 
-      // Dispose any old batch geometries that were unused during this render pass
-      // TODO should this be delayed any to prevent thrashing?
-      geometryPool.disposeUnused()
+      // Pack every member batch into its GPU buffers (incrementally where possible); each render
+      // batch object's geometry getter resolves to its member batch's packed geometry.
+      for (let key in this._memberBatchesByKey) {
+        this._memberBatchesByKey[key].forEach(memberBatch => {
+          if (memberBatch) memberBatch.pack()
+        })
+      }
     }
 
     // Add the batch objects to the scene
@@ -170,49 +242,50 @@ class InstancingManager extends Group3DFacade {
 
   _onInstanceRemoved(facade) {
     delete this._instanceables[facade.$facadeId]
+    // Release the facade's slot in its member batch
+    if (facade._memberRecord && facade._memberBatch) {
+      facade._memberBatch.removeMember(facade._memberRecord)
+      facade._memberRecord._memberBatch = null
+      facade._memberRecord = facade._memberBatch = null
+    }
     this._needsRebatch = true
   }
 
   _onInstanceChanged(facade) {
+    // The instancedThreeObject changed; its record belongs to a different batch now
+    if (facade._memberRecord && facade._memberBatch) {
+      facade._memberBatch.removeMember(facade._memberRecord)
+      facade._memberRecord._memberBatch = null
+      facade._memberRecord = facade._memberBatch = null
+    }
     this._needsRebatch = true
   }
 
   _onInstanceMatrixChanged(facade) {
-    // If a single instance's matrix changed and the batches are still otherwise valid, avoid a
-    // full rebatch by updating just this instance's values in the matrix attributes directly.
-    if (!this._needsRebatch) {
-      let protoObject = facade.instancedThreeObject
-      let batchObject = facade._instancingBatchObject
-      let attrOffset = facade._instancingBatchAttrOffset
-      if (protoObject && batchObject && this._getBatchKey(protoObject) === this._getBatchKey(batchObject)) {
-        let attrs = batchObject.geometry._instanceAttrs.matrix
-        let elements = facade.threeObject.matrixWorld.elements
-        attrs[0].setXYZW(attrOffset, elements[0], elements[4], elements[8], elements[12]).version++
-        attrs[1].setXYZW(attrOffset, elements[1], elements[5], elements[9], elements[13]).version++
-        attrs[2].setXYZW(attrOffset, elements[2], elements[6], elements[10], elements[14]).version++
-      } else {
-        // Fallback just in case something didn't line up above - clear pointers and trigger rebatch
-        facade._instancingBatchObject = facade._instancingBatchAttrOffset = null
-        this._needsRebatch = true
-      }
+    // If a single instance's matrix changed and the batches are still otherwise valid, update
+    // its shared member record immediately. Matrix updates never wait on any other work (e.g.
+    // text typesetting); the member is at its new world position on this same frame. A full
+    // rebatch flag is set so the render-time pack picks the incremental buffer write up.
+    const memberBatch = facade._memberBatch
+    const record = facade._memberRecord
+    if (memberBatch && record) {
+      record.matrix.copy(facade.threeObject.matrixWorld)
+      memberBatch.markMemberMatrixDirty(record)
     }
+    this._needsRebatch = true
   }
 
   _onInstanceUniformChanged(facade, uniformName) {
-    if (!this._needsRebatch) {
-      let protoObject = facade.instancedThreeObject
-      let batchObject = facade._instancingBatchObject
-      let attr
-      if (protoObject && batchObject && this._getBatchKey(protoObject) === this._getBatchKey(batchObject)
-        && (attr = batchObject.geometry._instanceAttrs.uniforms[uniformName])) {
-        setAttributeValue(attr, facade._instancingBatchAttrOffset, facade._instanceUniforms[uniformName])
-        attr.version++ //skip setter
-      } else {
-        // Fallback just in case something didn't line up above - clear pointers and trigger rebatch
-        facade._instancingBatchObject = facade._instancingBatchAttrOffset = null
-        this._needsRebatch = true
-      }
+    const memberBatch = facade._memberBatch
+    const record = facade._memberRecord
+    if (memberBatch && record && facade.instancedThreeObject) {
+      const facadeUniforms = facade._instanceUniforms
+      const value = (facadeUniforms && uniformName in facadeUniforms) ?
+        facadeUniforms[uniformName] :
+        getDefaultUniformValue(facade.instancedThreeObject.material, uniformName)
+      memberBatch.setMemberUniform(record, uniformName, value)
     }
+    this._needsRebatch = true
   }
 
   _getBatchKey(object) {
@@ -238,49 +311,28 @@ class InstancingManager extends Group3DFacade {
     return namesArray
   }
 
-  _getInstanceUniformSizes(material, uniformNames) {
-    // Cache results per material for duration of this frame
-    let cache = this._uniformSizesCache || (this._uniformSizesCache = new Map())
-    let result = cache.get(material)
-    if (!result) {
-      result = Object.create(null)
-      if (uniformNames) {
-        uniformNames.forEach(name => {
-          let size = getUniformItemSize(material, name)
-          if (size > 0) {
-            result[name] = size
-          } else {
-            console.warn(`Could not determine item size for uniform ${name}`)
-          }
-        })
-      }
-      cache.set(material, result)
-    }
-    return result
-  }
-
-  _getBatchObject(instancedObject) {
+  _getBatchObject(instancedObject, memberBatch) {
     let {geometry, material} = instancedObject
 
-    // Upgrade the geometry to an instanced one
+    // Upgrade the material to one with the shader modifications for instancing
     if (!geometry.isBufferGeometry) {
       throw new Error('Instanceable proto object must use a BufferGeometry')
     }
-    let batchKey = this._getBatchKey(instancedObject)
     let uniformNames = this._getInstanceUniformNames(instancedObject)
-    let uniformSizes = this._getInstanceUniformSizes(material, uniformNames)
-    let batchGeometry = this._batchGeometryPool.borrow(batchKey, geometry, uniformSizes)
-    setInstanceCount(batchGeometry, 0)
-
-    // Upgrade the material to one with the shader modifications for instancing
-    let batchMaterial = getInstancingDerivedMaterial(material, uniformNames)
+    let batchMaterial = getInstancingDerivedMaterial(material, uniformNames ? uniformNames.slice() : [])
     let depthMaterial, distanceMaterial
 
-    // Create a new mesh object to hold it all
+    // Create a new mesh object to hold it all. Its geometry getter always resolves to the
+    // MemberBatch's current packed geometry, so buffer rebuilds are picked up automatically.
     let batchObject = Object.create(instancedObject, {
       // Redefine properties rather than setting them so we don't inadvertently trigger setters on
       // the base object:
-      geometry: { value: batchGeometry },
+      geometry: {
+        get() {
+          return memberBatch._instancedGeometry
+        },
+        configurable: true
+      },
       material: { value: batchMaterial },
       visible: { value: true },
       frustumCulled: { value: false },
@@ -307,7 +359,7 @@ class InstancingManager extends Group3DFacade {
           if (!distanceMaterial) {
             distanceMaterial = batchMaterial.getDistanceMaterial()
             // We need to trick WebGLRenderer into setting the `viewMatrix` uniform, which it doesn't
-            // normally do for MeshDistanceMaterial but it's needed by the instancing shader code. It does
+            // normally do for MeshDistanceMaterial but is needed by the instancing shader code. It does
             // for ShaderMaterials so we pretend to be one.
             distanceMaterial.isShaderMaterial = true
             distanceMaterial.uniformsGroups = distanceMaterial.uniformsGroups || [];
@@ -347,114 +399,28 @@ class InstancingManager extends Group3DFacade {
     })
     batchObject.$troikaBatchBaseObj = instancedObject
     batchObject.$troikaInstancingManager = this
+    batchObject.$memberBatch = memberBatch
     // NOTE other props are inherited so don't need to copy them
     return batchObject
   }
 
   _teardownBatchObjects(renderer, scene, camera) {
-    // Release geometries to the pool for next time
-    this._batchGeometryPool.releaseAll()
-
     // Clear caches from this render frame
     this._batchKeysCache = null
     this._uniformNamesCache = null
-    this._uniformSizesCache = null
 
     // Remove batch objects from scene
     scene.children = scene.children.filter(obj => obj.$troikaInstancingManager !== this)
   }
 
   destructor() {
-    let pool = this._batchGeometryPool
-    pool.releaseAll()
-    pool.disposeUnused()
+    for (let key in this._memberBatchesByKey) {
+      this._memberBatchesByKey[key].forEach(memberBatch => {
+        if (memberBatch) memberBatch.dispose()
+      })
+    }
+    this._memberBatchesByKey = Object.create(null)
     super.destructor()
-  }
-}
-
-
-/**
- * Pool for the instancing batch geometries
- */
-class BatchGeometryPool {
-  constructor() {
-    this._poolsByKey = Object.create(null)
-  }
-
-  borrow(key, baseGeometry, instanceUniformSizes) {
-    let poolsByKey = this._poolsByKey
-    let pool = poolsByKey[key] || (poolsByKey[key] = {geometries: [], firstFree: 0})
-    let batchGeometry = pool.geometries[pool.firstFree++]
-
-    if (!batchGeometry) {
-      batchGeometry = new InstancedBufferGeometry()
-      assign(batchGeometry, baseGeometry)
-      batchGeometry.attributes = assign({}, baseGeometry.attributes)
-      let instanceAttrs = batchGeometry._instanceAttrs = {matrix: [], uniforms: Object.create(null)} //separate collections for quicker lookup
-
-      // Create instancing attributes for the modelMatrix's rows
-      for (let row = 0; row < 3; row++) {
-        let attr = new InstancedBufferAttribute(new Float32Array(INSTANCE_BATCH_SIZE * 4), 4)
-        if (attr.setUsage) {
-          attr.setUsage(DYNAMIC_DRAW)
-        } else {
-          attr.dynamic = true
-        }
-        batchGeometry.attributes[`troika_modelMatrixRow${row}`] = attr
-        instanceAttrs.matrix[row] = attr
-      }
-
-      // Create instancing attributes for the instanceUniforms
-      for (let name in instanceUniformSizes) {
-        let itemSize = instanceUniformSizes[name]
-        let attr = new InstancedBufferAttribute(new Float32Array(INSTANCE_BATCH_SIZE * itemSize), itemSize)
-        if (attr.setUsage) {
-          attr.setUsage(DYNAMIC_DRAW)
-        } else {
-          attr.dynamic = true
-        }
-        batchGeometry.attributes[`troika_${name}`] = attr
-        instanceAttrs.uniforms[name] = attr
-      }
-
-      pool.geometries.push(batchGeometry)
-    }
-
-    return batchGeometry
-  }
-
-  releaseAll() {
-    let pools = this._poolsByKey
-    if (pools) {
-      for (let key in pools) {
-        pools[key].firstFree = 0
-      }
-    }
-  }
-
-  disposeUnused() {
-    let pools = this._poolsByKey
-    if (pools) {
-      for (let key in pools) {
-        let {firstFree, geometries} = pools[key]
-        for (let i = firstFree, len = geometries.length; i < len; i++) {
-          // Only allow the instancing attributes to be disposed; those copied from the
-          // original geometry will be up to the author to dispose of properly
-          let attrs = geometries[i].attributes
-          for (let attrName in attrs) {
-            if (attrs.hasOwnProperty(attrName) && attrName.indexOf('troika_') !== 0) {
-              delete attrs[attrName]
-            }
-          }
-          try {
-            // can throw if it's already been disposed or hasn't yet been rendered
-            geometries[i].dispose()
-          } catch(e) { /* empty */ }
-          geometries[i]._instanceAttrs = null
-        }
-        geometries.length = firstFree
-      }
-    }
   }
 }
 
@@ -469,58 +435,9 @@ proto._notifyWorldHandlers = {
 }
 
 
-function setAttributeValue(attr, offset, value) {
-  let size = attr.itemSize
-  if (size === 1) {
-    attr.setX(offset, value)
-  }
-  else if (size === 2) {
-    attr.setXY(offset, value.x, value.y)
-  }
-  else if (size === 3) {
-    if (value.isColor) {
-      attr.setXYZ(offset, value.r, value.g, value.b)
-    } else {
-      attr.setXYZ(offset, value.x, value.y, value.z)
-    }
-  } else if (size === 4) {
-    attr.setXYZW(offset, value.x, value.y, value.z, value.w)
-  }
-}
-
-function getDefaultUniformValue(material, name) {
-  // Try uniforms on the material itself, then try the builtin material shaders
-  let uniforms = material.uniforms
-  if (uniforms && uniforms[name]) {
-    return uniforms[name].value
-  }
-  uniforms = getShadersForMaterial(material).uniforms
-  if (uniforms && uniforms[name]) {
-    return uniforms[name].value
-  }
-  return null
-}
-
-function getUniformItemSize(material, name) {
-  return getItemSizeForValue(getDefaultUniformValue(material, name))
-}
-
-function getItemSizeForValue(value) {
-  return value == null ? 0
-    : typeof value === 'number' ? 1
-    : value.isVector2 ? 2
-    : (value.isVector3 || value.isColor) ? 3
-    : value.isVector4 ? 4
-    : Array.isArray(value) ? value.length
-    : 0
-}
-
 // Handle maxInstancedCount -> instanceCount rename that happened in three r117
 function getInstanceCount(geom) {
   return geom[geom.hasOwnProperty('instanceCount') ? 'instanceCount' : 'maxInstancedCount']
-}
-function setInstanceCount(geom, count) {
-  geom[geom.hasOwnProperty('instanceCount') ? 'instanceCount' : 'maxInstancedCount'] = count
 }
 
 export default InstancingManager

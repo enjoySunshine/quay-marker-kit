@@ -42,6 +42,7 @@ nav:
           - troika-3d/interactivity-and-events.md
           - troika-3d/performance.md
           - troika-3d/instancing.md
+          - troika-3d/member-data.md
           - troika-3d/html-overlays.md
           - troika-3d/text.md
           - troika-3d-ui/index.md

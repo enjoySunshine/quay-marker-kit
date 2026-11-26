@@ -11,6 +11,8 @@ export {default as World3DFacade} from './facade/World3DFacade.js'
 export {makeWorldTextureProvider} from './facade/WorldTextureProvider.js'
 export {default as InstancingManager} from './facade/instancing/InstancingManager.js'
 export {default as Instanceable3DFacade} from './facade/instancing/Instanceable3DFacade.js'
+export {MemberBatch} from './facade/members/MemberBatch.js'
+export {SceneMemberRenderer} from './facade/members/SceneMemberRenderer.js'
 
 // Primitives
 export {BoxFacade} from './facade/primitives/BoxFacade.js'

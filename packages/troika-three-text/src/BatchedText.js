@@ -1,7 +1,7 @@
 import { Text } from "./Text.js";
 import { ColorManagement, DataTexture, FloatType, RGBAFormat, Vector2, Box3, Color, DynamicDrawUsage } from "three";
 import { glyphBoundsAttrName, glyphIndexAttrName } from "./GlyphsGeometry.js";
-import { createDerivedMaterial } from "troika-three-utils";
+import { createDerivedMaterial, createMemberRecord } from "troika-three-utils";
 import { createTextDerivedMaterial } from "./TextDerivedMaterial.js";
 
 const syncStartEvent = { type: "syncstart" };
@@ -52,19 +52,13 @@ export class BatchedText extends Text {
     super();
 
     /**
-     * @typedef {Object} PackingInfo
-     * @property {number} index - the packing order index when last packed, or -1
-     * @property {boolean} dirty - whether it has synced since last pack
-     */
-
-    /**
-     * @type {Map<Text, PackingInfo>}
+     * @type {Map<Text, MemberRecord>}
      */
     this._members = new Map();
     this._dataTextures = {}
 
     this._onMemberSynced = (e) => {
-      this._members.get(e.target).dirty = true;
+      this._members.get(e.target).userData.dirty = true;
     };
   }
 
@@ -102,11 +96,14 @@ export class BatchedText extends Text {
    */
   addText (text) {
     if (!this._members.has(text)) {
-      this._members.set(text, {
-        index: -1,
-        glyphCount: -1,
-        dirty: true
-      });
+      // Use the same member record shape as the instancing batches (MemberBatch): one record
+      // per item carrying its matrix, color, visibility and a userData slot for text-specific
+      // packing state. This lets a text label and an instanced column be driven by the same
+      // member data and read back the same world coordinates.
+      const record = createMemberRecord();
+      record.userData.glyphCount = -1;
+      record.userData.dirty = true;
+      this._members.set(text, record);
       text.addEventListener("synccomplete", this._onMemberSynced);
     }
   }
@@ -188,12 +185,13 @@ export class BatchedText extends Text {
     }
     // Resolved on first use, not per member: the material getter calls hasOutline(), which loops over all members
     let fallbackColor;
-    this._members.forEach(({ index, dirty }, text) => {
-      if (index > -1) {
-        const startIndex = index * floatsPerMember
+    this._members.forEach((record, text) => {
+      if (record.index > -1) {
+        const startIndex = record.index * floatsPerMember
 
-        // Matrix
-        const matrix = text.matrix.elements;
+        // Matrix: read from the shared member record, kept in sync with the Text's local
+        // matrix during sync(). This is the same matrix field an instanced mesh batch reads.
+        const matrix = record.matrix.elements;
         for (let i = 0; i < 16; i++) {
           setTexData(startIndex + i, matrix[i])
         }
@@ -268,9 +266,9 @@ export class BatchedText extends Text {
     // Trigger sync on all members that need it
     let syncPromises = this._needsRepack ? [] : null;
     this._needsRepack = false;
-    this._members.forEach((packingInfo, text) => {
-      if (packingInfo.dirty || text._needsSync) {
-        packingInfo.dirty = false;
+    this._members.forEach((record, text) => {
+      if (record.userData.dirty || text._needsSync) {
+        record.userData.dirty = false;
         (syncPromises || (syncPromises = [])).push(new Promise(resolve => {
           if (text._needsSync) {
             text.sync(resolve);
@@ -294,7 +292,7 @@ export class BatchedText extends Text {
 
         // Initial pass to collect total glyph count and resize the arrays if needed
         let totalGlyphCount = 0;
-        this._members.forEach((packingInfo, { textRenderInfo }) => {
+        this._members.forEach((record, { textRenderInfo }) => {
           if (textRenderInfo) {
             totalGlyphCount += textRenderInfo.glyphAtlasIndices.length;
             this._textRenderInfo = textRenderInfo; // TODO - need this, but be smarter
@@ -309,7 +307,8 @@ export class BatchedText extends Text {
         // Populate batch arrays
         let memberIndex = 0;
         let glyphIndex = 0;
-        this._members.forEach((packingInfo, { textRenderInfo }) => {
+        this._members.forEach((record, text) => {
+          const { textRenderInfo } = text;
           if (textRenderInfo) {
             const glyphCount = textRenderInfo.glyphAtlasIndices.length;
             memberIndexes.fill(memberIndex, glyphIndex, glyphIndex + glyphCount);
@@ -319,7 +318,14 @@ export class BatchedText extends Text {
             batchedGlyphBounds.set(textRenderInfo.glyphBounds, glyphIndex * 4, (glyphIndex + glyphCount) * 4);
 
             glyphIndex += glyphCount;
-            packingInfo.index = memberIndex++;
+            // Keep the shared member record's matrix identical to the Text's local matrix, so
+            // any consumer of the member data sees the same transform the data texture uses.
+            if (text.matrixAutoUpdate) text.updateMatrix();
+            record.matrix.copy(text.matrix);
+            record.color = text.color;
+            record.visible = text.visible !== false;
+            record.index = memberIndex++;
+            record.userData.glyphCount = glyphCount;
           }
         });
 
